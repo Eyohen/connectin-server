@@ -1,691 +1,377 @@
+const { Op } = require('sequelize');
 const db = require('../models');
-const { Conversation, Message, Creator, Brand, User, CollaborationRequest } = db;
 const papersignal = require('../services/papersignal.service');
+const { formatUserSummary, getProfileForUser, getProfileName } = require('../utils/profileFormatter');
 
-// Helper: Get user display info
-const getUserDisplayInfo = async (userId) => {
-  const user = await User.findByPk(userId);
-  if (!user) return null;
+const { Connection, User, PersonalProfile, BusinessProfile } = db;
 
-  if (user.userType === 'creator') {
-    const creator = await Creator.findOne({ where: { userId } });
-    return {
-      id: userId,
-      displayName: creator?.displayName || 'Creator',
-      avatar: creator?.profileImage || null,
-      entityId: creator?.id,
-      entityType: 'creator'
-    };
-  } else if (user.userType === 'brand') {
-    const brand = await Brand.findOne({ where: { userId } });
-    return {
-      id: userId,
-      displayName: brand?.companyName || 'Brand',
-      avatar: brand?.logo || null,
-      entityId: brand?.id,
-      entityType: 'brand'
-    };
-  }
-  return null;
-};
+const includeProfiles = () => [
+  { model: PersonalProfile, as: 'personalProfile', required: false },
+  { model: BusinessProfile, as: 'businessProfile', required: false },
+];
 
-// Helper: Get or create Papersignal room for a conversation
-const ensurePapersignalRoom = async (conversation) => {
-  if (conversation.papersignalRoomId) {
-    return { roomId: conversation.papersignalRoomId, conversation };
-  }
+const userAttributes = ['id', 'email', 'userType', 'verified', 'status', 'createdAt'];
 
-  // Get user info for both participants
-  const creator = await Creator.findByPk(conversation.creatorId, {
-    include: [{ model: User, as: 'user' }]
-  });
-  const brand = await Brand.findByPk(conversation.brandId, {
-    include: [{ model: User, as: 'user' }]
-  });
+const loadUser = (id) => User.findByPk(id, {
+  attributes: userAttributes,
+  include: includeProfiles(),
+});
 
-  if (!creator || !brand) {
-    throw new Error('Participants not found');
-  }
-
-  // Create room in Papersignal
-  const result = await papersignal.getOrCreateDirectConversation(
-    {
-      id: creator.user.id,
-      displayName: creator.displayName || 'Creator',
-      avatar: creator.profileImage
-    },
-    {
-      id: brand.user.id,
-      displayName: brand.companyName || 'Brand',
-      avatar: brand.logo
-    },
-    {
-      localConversationId: conversation.id,
-      requestId: conversation.requestId,
-      creatorId: conversation.creatorId,
-      brandId: conversation.brandId
-    }
-  );
-
-  const papersignalRoomId = result.room.id;
-
-  // Check if another conversation already has this Papersignal room ID
-  const existingWithRoom = await Conversation.findOne({
-    where: { papersignalRoomId },
-    include: [
-      { model: Creator, as: 'creator', include: [{ model: User, as: 'user', attributes: ['id'] }] },
-      { model: Brand, as: 'brand', include: [{ model: User, as: 'user', attributes: ['id'] }] },
-      { model: CollaborationRequest, as: 'request' }
-    ]
-  });
-
-  if (existingWithRoom) {
-    // Another conversation already has this room - delete the duplicate and return the existing one
-    if (existingWithRoom.id !== conversation.id) {
-      await conversation.destroy();
-    }
-    return { roomId: papersignalRoomId, conversation: existingWithRoom };
-  }
-
-  // Store the Papersignal room ID
-  await conversation.update({ papersignalRoomId });
-
-  return { roomId: papersignalRoomId, conversation };
-};
-
-// Helper: Transform Papersignal message to local format
-const transformMessage = (psMessage, currentUserId) => {
+const toPapersignalUser = (user) => {
+  const profile = getProfileForUser(user);
   return {
-    id: psMessage.id,
-    senderId: psMessage.userId || psMessage.sender?.externalId,
-    senderName: psMessage.userName || psMessage.sender?.displayName,
-    senderAvatar: psMessage.userAvatar || psMessage.sender?.avatarUrl,
-    content: psMessage.content,
-    messageType: psMessage.messageType || 'text',
-    attachments: psMessage.attachments || [],
-    reactions: psMessage.reactions || {},
-    isEdited: psMessage.edited || psMessage.editedAt != null,
-    isDeleted: psMessage.isDeleted || psMessage.deleted,
-    createdAt: psMessage.createdAt,
-    updatedAt: psMessage.updatedAt
+    id: user.id,
+    displayName: getProfileName(user),
+    avatar: user.userType === 'business' ? profile?.logoUrl : profile?.avatarUrl,
   };
 };
 
-// ==================== CONVERSATIONS ====================
+const getConnectedUsers = async (userId) => {
+  const connections = await Connection.findAll({
+    where: {
+      status: 'connected',
+      [Op.or]: [
+        { requesterId: userId },
+        { recipientId: userId },
+      ],
+    },
+    include: [
+      {
+        model: User,
+        as: 'requester',
+        attributes: userAttributes,
+        include: includeProfiles(),
+      },
+      {
+        model: User,
+        as: 'recipient',
+        attributes: userAttributes,
+        include: includeProfiles(),
+      },
+    ],
+    order: [['updatedAt', 'DESC']],
+  });
 
-// Get all conversations
+  return connections
+    .map((connection) => {
+      const otherUser = connection.requesterId === userId ? connection.recipient : connection.requester;
+      if (!otherUser || otherUser.status !== 'active') return null;
+
+      return {
+        connectionId: connection.id,
+        connectedAt: connection.respondedAt || connection.updatedAt,
+        ...formatUserSummary(otherUser),
+      };
+    })
+    .filter(Boolean);
+};
+
+const ensureConnected = async (userId, otherUserId) => {
+  if (!otherUserId || userId === otherUserId) return false;
+
+  const count = await Connection.count({
+    where: {
+      status: 'connected',
+      [Op.or]: [
+        { requesterId: userId, recipientId: otherUserId },
+        { requesterId: otherUserId, recipientId: userId },
+      ],
+    },
+  });
+
+  return count > 0;
+};
+
+const roomParticipants = (room = {}) => room.participants || room.members || [];
+
+const participantUserId = (participant = {}) =>
+  participant.userId ||
+  participant.externalId ||
+  participant.id ||
+  participant.user?.id ||
+  participant.user?.externalId;
+
+const roomHasUser = (room, userId) =>
+  roomParticipants(room).some((participant) => participantUserId(participant) === userId);
+
+const assertRoomAccess = async (roomId, userId, options = {}) => {
+  const result = await papersignal.getRoom(roomId, options);
+  const room = result.room || result.data?.room || result;
+
+  if (!room || !roomHasUser(room, userId)) {
+    const error = new Error('Access denied');
+    error.status = 403;
+    throw error;
+  }
+
+  return { result, room };
+};
+
+const transformMessage = (message = {}, currentUserId) => ({
+  id: message.id,
+  senderId: message.userId || message.sender?.externalId || message.sender?.id,
+  senderName: message.userName || message.sender?.displayName || 'User',
+  senderAvatar: message.userAvatar || message.sender?.avatarUrl || null,
+  content: message.content || '',
+  messageType: message.messageType || 'text',
+  reactions: message.reactions || {},
+  isEdited: Boolean(message.editedAt || message.edited),
+  isDeleted: Boolean(message.isDeleted || message.deleted),
+  isMine: (message.userId || message.sender?.externalId || message.sender?.id) === currentUserId,
+  createdAt: message.createdAt,
+  updatedAt: message.updatedAt,
+});
+
+const normalizeConversation = (conversation = {}, currentUserId) => {
+  const participants = roomParticipants(conversation);
+  const otherParticipant = participants.find((participant) => participantUserId(participant) !== currentUserId);
+  const otherParticipantName = otherParticipant?.userName || otherParticipant?.displayName || otherParticipant?.name;
+  const displayName = conversation.type === 'direct'
+    ? (otherParticipantName || 'Conversation')
+    : (conversation.name || otherParticipantName || 'Conversation');
+
+  return {
+    id: conversation.id,
+    roomId: conversation.id,
+    name: displayName,
+    type: conversation.type || 'direct',
+    participants,
+    unreadCount: conversation.unreadCount || 0,
+    lastMessage: conversation.lastMessage || null,
+    lastMessageAt: conversation.lastMessageAt,
+    otherUserId: participantUserId(otherParticipant),
+    avatar: displayName
+      .split(' ')
+      .filter(Boolean)
+      .slice(0, 2)
+      .map((part) => part[0]?.toUpperCase())
+      .join('') || 'CN',
+  };
+};
+
+exports.getConfig = (req, res) => {
+  res.json({
+    success: true,
+    data: {
+      socketUrl: papersignal.getSocketUrl(),
+    },
+  });
+};
+
+exports.getContacts = async (req, res) => {
+  try {
+    const contacts = await getConnectedUsers(req.userId);
+    res.json({ success: true, data: contacts });
+  } catch (error) {
+    console.error('Get message contacts error:', error);
+    res.status(500).json({ success: false, message: 'Failed to get contacts' });
+  }
+};
+
 exports.getConversations = async (req, res) => {
   try {
-    const userId = req.userId;
-    const userInfo = await getUserDisplayInfo(userId);
+    const { page = 1, limit = 20, type } = req.query;
+    const result = await papersignal.getUserConversations(req.userId, { page, limit, type });
 
-    if (!userInfo) {
-      return res.status(400).json({ success: false, message: 'User profile not found' });
-    }
-
-    // Get conversations from Papersignal
-    let papersignalConversations = [];
-    try {
-      const psResult = await papersignal.getUserConversations(userId);
-      papersignalConversations = psResult.conversations || [];
-    } catch (err) {
-      console.error('Failed to fetch from Papersignal, falling back to local:', err.message);
-    }
-
-    // Get local conversations for metadata enrichment
-    const where = {};
-    if (userInfo.entityType === 'creator') {
-      where.creatorId = userInfo.entityId;
-    } else {
-      where.brandId = userInfo.entityId;
-    }
-
-    const localConversations = await Conversation.findAll({
-      where,
-      include: [
-        { model: Creator, as: 'creator', attributes: ['id', 'displayName', 'profileImage'], include: [{ model: User, as: 'user', attributes: ['id'] }] },
-        { model: Brand, as: 'brand', attributes: ['id', 'companyName', 'logo'], include: [{ model: User, as: 'user', attributes: ['id'] }] },
-        { model: CollaborationRequest, as: 'request', attributes: ['id', 'title', 'status'] }
-      ],
-      order: [['lastMessageAt', 'DESC']]
+    res.json({
+      success: true,
+      data: {
+        conversations: (result.conversations || []).map((conversation) => normalizeConversation(conversation, req.userId)),
+        pagination: result.pagination || { page: Number(page), limit: Number(limit), total: result.conversations?.length || 0, totalPages: 1 },
+      },
     });
-
-    // Create a map for quick lookup
-    const localMap = new Map();
-    localConversations.forEach(conv => {
-      if (conv.papersignalRoomId) {
-        localMap.set(conv.papersignalRoomId, conv);
-      }
-    });
-
-    // Merge Papersignal data with local metadata
-    const enrichedConversations = papersignalConversations.map(psConv => {
-      const local = localMap.get(psConv.id);
-      return {
-        id: local?.id || psConv.id,
-        papersignalRoomId: psConv.id,
-        creator: local?.creator || null,
-        brand: local?.brand || null,
-        request: local?.request || null,
-        lastMessage: psConv.lastMessage ? {
-          content: psConv.lastMessage.content,
-          createdAt: psConv.lastMessage.createdAt,
-          senderName: psConv.lastMessage.userName
-        } : null,
-        lastMessageAt: psConv.lastMessageAt || local?.lastMessageAt,
-        unreadCount: psConv.unreadCount || 0,
-        isActive: local?.isActive ?? true
-      };
-    });
-
-    // Add local conversations that might not be in Papersignal yet
-    for (const local of localConversations) {
-      if (!local.papersignalRoomId || !papersignalConversations.find(p => p.id === local.papersignalRoomId)) {
-        enrichedConversations.push({
-          id: local.id,
-          papersignalRoomId: local.papersignalRoomId,
-          creator: local.creator,
-          brand: local.brand,
-          request: local.request,
-          lastMessage: local.lastMessagePreview ? {
-            content: local.lastMessagePreview,
-            createdAt: local.lastMessageAt
-          } : null,
-          lastMessageAt: local.lastMessageAt,
-          unreadCount: userInfo.entityType === 'creator' ? local.creatorUnreadCount : local.brandUnreadCount,
-          isActive: local.isActive
-        });
-      }
-    }
-
-    // Sort by lastMessageAt
-    enrichedConversations.sort((a, b) => {
-      const dateA = new Date(a.lastMessageAt || 0);
-      const dateB = new Date(b.lastMessageAt || 0);
-      return dateB - dateA;
-    });
-
-    res.json({ success: true, data: enrichedConversations });
   } catch (error) {
     console.error('Get conversations error:', error);
     res.status(500).json({ success: false, message: 'Failed to get conversations' });
   }
 };
 
-// Get single conversation
+exports.createDirectConversation = async (req, res) => {
+  try {
+    const { recipientId } = req.body;
+    const connected = await ensureConnected(req.userId, recipientId);
+
+    if (!connected) {
+      return res.status(403).json({ success: false, message: 'You can only message accepted connections' });
+    }
+
+    const [currentUser, recipient] = await Promise.all([
+      loadUser(req.userId),
+      loadUser(recipientId),
+    ]);
+
+    if (!currentUser || !recipient || recipient.status !== 'active') {
+      return res.status(404).json({ success: false, message: 'Recipient not found' });
+    }
+
+    const result = await papersignal.getOrCreateDirectConversation(
+      toPapersignalUser(currentUser),
+      toPapersignalUser(recipient),
+      { source: 'connectin', connectionOnly: true }
+    );
+
+    res.status(result.created ? 201 : 200).json({
+      success: true,
+      data: {
+        room: normalizeConversation(result.room, req.userId),
+        created: Boolean(result.created),
+      },
+    });
+  } catch (error) {
+    console.error('Create direct conversation error:', error);
+    res.status(500).json({ success: false, message: 'Failed to start conversation' });
+  }
+};
+
 exports.getConversation = async (req, res) => {
   try {
-    const conversation = await Conversation.findByPk(req.params.id, {
-      include: [
-        { model: Creator, as: 'creator', include: [{ model: User, as: 'user', attributes: ['id'] }] },
-        { model: Brand, as: 'brand', include: [{ model: User, as: 'user', attributes: ['id'] }] },
-        { model: CollaborationRequest, as: 'request' }
-      ]
+    const limit = Math.min(Math.max(parseInt(req.query.limit || '50', 10), 1), 100);
+    const { result, room } = await assertRoomAccess(req.params.roomId, req.userId, {
+      limit,
+      before: req.query.before,
     });
-
-    if (!conversation) {
-      return res.status(404).json({ success: false, message: 'Conversation not found' });
-    }
-
-    // Verify user has access
-    const userId = req.userId;
-    const hasAccess = conversation.creator?.user?.id === userId || conversation.brand?.user?.id === userId;
-    if (!hasAccess) {
-      return res.status(403).json({ success: false, message: 'Access denied' });
-    }
-
-    // Ensure Papersignal room exists
-    const { roomId, conversation: activeConversation } = await ensurePapersignalRoom(conversation);
-
-    // Get room details from Papersignal
-    let roomDetails = null;
-    try {
-      roomDetails = await papersignal.getRoom(roomId, { limit: 1 });
-    } catch (err) {
-      console.error('Failed to get Papersignal room:', err.message);
-    }
 
     res.json({
       success: true,
       data: {
-        ...activeConversation.toJSON(),
-        papersignalRoom: roomDetails?.room || null
-      }
+        room: normalizeConversation(room, req.userId),
+        messages: (room.messages || result.messages || []).map((message) => transformMessage(message, req.userId)),
+      },
     });
   } catch (error) {
     console.error('Get conversation error:', error);
-    res.status(500).json({ success: false, message: 'Failed to get conversation' });
+    res.status(error.status || 500).json({ success: false, message: error.status === 403 ? 'Access denied' : 'Failed to get conversation' });
   }
 };
 
-// Get messages (from Papersignal)
 exports.getMessages = async (req, res) => {
   try {
-    const { page = 1, limit = 50, before } = req.query;
-    const conversationId = req.params.id;
-
-    const conversation = await Conversation.findByPk(conversationId);
-    if (!conversation) {
-      return res.status(404).json({ success: false, message: 'Conversation not found' });
-    }
-
-    // Ensure Papersignal room exists
-    const { roomId } = await ensurePapersignalRoom(conversation);
-
-    // Get messages from Papersignal
-    const result = await papersignal.getRoom(roomId, { limit: parseInt(limit), before });
-
-    const rawMessages = result.room?.messages || [];
-
-    // Papersignal returns messages in OLDEST FIRST order
-    // Frontend expects NEWEST FIRST (for flex-col-reverse display)
-    const messages = rawMessages
-      .map(msg => transformMessage(msg, req.userId))
-      .reverse();
+    const limit = Math.min(Math.max(parseInt(req.query.limit || '50', 10), 1), 100);
+    const { result, room } = await assertRoomAccess(req.params.roomId, req.userId, {
+      limit,
+      before: req.query.before,
+    });
 
     res.json({
       success: true,
       data: {
-        messages, // Newest first - frontend uses flex-col-reverse for display
-        pagination: {
-          page: parseInt(page),
-          limit: parseInt(limit),
-          hasMore: messages.length === parseInt(limit)
-        }
-      }
+        messages: (room.messages || result.messages || []).map((message) => transformMessage(message, req.userId)),
+        pagination: { limit, hasMore: (room.messages || result.messages || []).length === limit },
+      },
     });
   } catch (error) {
     console.error('Get messages error:', error);
-    res.status(500).json({ success: false, message: 'Failed to get messages' });
+    res.status(error.status || 500).json({ success: false, message: error.status === 403 ? 'Access denied' : 'Failed to get messages' });
   }
 };
 
-// Send message (via Papersignal)
 exports.sendMessage = async (req, res) => {
   try {
-    const { content, messageType = 'text', attachments, metadata } = req.body;
-    const conversationId = req.params.id;
-    const userId = req.userId;
-
-    if (!content || !content.trim()) {
+    const { content, messageType = 'text', metadata = {} } = req.body;
+    if (!content?.trim()) {
       return res.status(400).json({ success: false, message: 'Message content is required' });
     }
 
-    const conversation = await Conversation.findByPk(conversationId);
-    if (!conversation) {
-      return res.status(404).json({ success: false, message: 'Conversation not found' });
+    await assertRoomAccess(req.params.roomId, req.userId, { limit: 1 });
+
+    const currentUser = await loadUser(req.userId);
+    if (!currentUser) {
+      return res.status(404).json({ success: false, message: 'User not found' });
     }
 
-    // Get user display info
-    const userInfo = await getUserDisplayInfo(userId);
-    if (!userInfo) {
-      return res.status(400).json({ success: false, message: 'User profile not found' });
-    }
-
-    // Ensure Papersignal room exists
-    const { roomId } = await ensurePapersignalRoom(conversation);
-
-    // Send message via Papersignal
-    const result = await papersignal.sendMessage(roomId, {
-      userId,
+    const userInfo = toPapersignalUser(currentUser);
+    const result = await papersignal.sendMessage(req.params.roomId, {
+      userId: req.userId,
       userName: userInfo.displayName,
       userAvatar: userInfo.avatar,
       content: content.trim(),
       messageType,
-      metadata: {
-        ...metadata,
-        attachments,
-        localConversationId: conversationId
-      }
+      metadata: { ...metadata, source: 'connectin' },
     });
-
-    // Update local conversation
-    await conversation.update({
-      lastMessageAt: new Date(),
-      lastMessagePreview: content.substring(0, 255)
-    });
-
-    // Increment unread count for the other participant
-    if (userInfo.entityType === 'creator') {
-      await conversation.increment('brandUnreadCount');
-    } else {
-      await conversation.increment('creatorUnreadCount');
-    }
-
-    // Emit via local socket for immediate UI update
-    const io = req.app.get('io');
-    if (io) {
-      io.to(`conversation:${conversationId}`).emit('new_message', {
-        ...transformMessage(result.message, userId),
-        conversationId
-      });
-    }
 
     res.status(201).json({
       success: true,
-      data: transformMessage(result.message, userId)
+      data: transformMessage(result.message || result.data?.message || result, req.userId),
     });
   } catch (error) {
     console.error('Send message error:', error);
-    res.status(500).json({ success: false, message: 'Failed to send message' });
+    res.status(error.status || 500).json({ success: false, message: error.status === 403 ? 'Access denied' : 'Failed to send message' });
   }
 };
 
-// Mark as read
 exports.markAsRead = async (req, res) => {
   try {
-    const conversationId = req.params.id;
-    const userId = req.userId;
-
-    const conversation = await Conversation.findByPk(conversationId);
-    if (!conversation) {
-      return res.status(404).json({ success: false, message: 'Conversation not found' });
-    }
-
-    // Mark as read in Papersignal
-    if (conversation.papersignalRoomId) {
-      try {
-        await papersignal.markAsRead(conversation.papersignalRoomId, userId);
-      } catch (err) {
-        console.error('Failed to mark as read in Papersignal:', err.message);
-      }
-    }
-
-    // Reset local unread count
-    const userInfo = await getUserDisplayInfo(userId);
-    if (userInfo?.entityType === 'creator') {
-      await conversation.update({ creatorUnreadCount: 0 });
-    } else {
-      await conversation.update({ brandUnreadCount: 0 });
-    }
-
-    // Emit read receipt via socket
-    const io = req.app.get('io');
-    if (io) {
-      io.to(`conversation:${conversationId}`).emit('messages_read', {
-        conversationId,
-        userId,
-        readAt: new Date()
-      });
-    }
-
-    res.json({ success: true, message: 'Marked as read' });
+    await assertRoomAccess(req.params.roomId, req.userId, { limit: 1 });
+    const result = await papersignal.markAsRead(req.params.roomId, req.userId, req.body.messageId || null);
+    res.json({ success: true, data: result });
   } catch (error) {
     console.error('Mark as read error:', error);
-    res.status(500).json({ success: false, message: 'Failed to mark as read' });
+    res.status(error.status || 500).json({ success: false, message: error.status === 403 ? 'Access denied' : 'Failed to mark as read' });
   }
 };
 
-// Get conversation by request
-exports.getConversationByRequest = async (req, res) => {
-  try {
-    const conversation = await Conversation.findOne({
-      where: { requestId: req.params.requestId },
-      include: [
-        { model: Creator, as: 'creator', include: [{ model: User, as: 'user', attributes: ['id'] }] },
-        { model: Brand, as: 'brand', include: [{ model: User, as: 'user', attributes: ['id'] }] }
-      ]
-    });
-
-    if (!conversation) {
-      return res.status(404).json({ success: false, message: 'Conversation not found' });
-    }
-
-    res.json({ success: true, data: conversation });
-  } catch (error) {
-    console.error('Get conversation by request error:', error);
-    res.status(500).json({ success: false, message: 'Failed to get conversation' });
-  }
-};
-
-// ==================== NEW FEATURES ====================
-
-// Create or get conversation (for starting new chats)
-exports.createOrGetConversation = async (req, res) => {
-  try {
-    const { creatorId, brandId, requestId } = req.body;
-    const userId = req.userId;
-
-    if (!creatorId || !brandId) {
-      return res.status(400).json({ success: false, message: 'creatorId and brandId are required' });
-    }
-
-    // Check if conversation exists
-    let conversation = await Conversation.findOne({
-      where: { creatorId, brandId },
-      include: [
-        { model: Creator, as: 'creator', include: [{ model: User, as: 'user', attributes: ['id'] }] },
-        { model: Brand, as: 'brand', include: [{ model: User, as: 'user', attributes: ['id'] }] },
-        { model: CollaborationRequest, as: 'request' }
-      ]
-    });
-
-    let created = false;
-    if (!conversation) {
-      conversation = await Conversation.create({
-        creatorId,
-        brandId,
-        requestId: requestId || null
-      });
-      conversation = await Conversation.findByPk(conversation.id, {
-        include: [
-          { model: Creator, as: 'creator', include: [{ model: User, as: 'user', attributes: ['id'] }] },
-          { model: Brand, as: 'brand', include: [{ model: User, as: 'user', attributes: ['id'] }] },
-          { model: CollaborationRequest, as: 'request' }
-        ]
-      });
-      created = true;
-    }
-
-    // Ensure Papersignal room exists (may return a different conversation if duplicate was found)
-    const { conversation: activeConversation } = await ensurePapersignalRoom(conversation);
-
-    res.json({
-      success: true,
-      data: activeConversation,
-      created
-    });
-  } catch (error) {
-    console.error('Create conversation error:', error);
-    res.status(500).json({ success: false, message: 'Failed to create conversation' });
-  }
-};
-
-// Add reaction to message
 exports.addReaction = async (req, res) => {
   try {
-    const { conversationId, messageId } = req.params;
     const { emoji } = req.body;
-    const userId = req.userId;
+    if (!emoji) return res.status(400).json({ success: false, message: 'Emoji is required' });
 
-    if (!emoji) {
-      return res.status(400).json({ success: false, message: 'Emoji is required' });
-    }
-
-    const conversation = await Conversation.findByPk(conversationId);
-    if (!conversation || !conversation.papersignalRoomId) {
-      return res.status(404).json({ success: false, message: 'Conversation not found' });
-    }
-
-    const userInfo = await getUserDisplayInfo(userId);
-
-    const result = await papersignal.addReaction(
-      conversation.papersignalRoomId,
-      messageId,
-      {
-        userId,
-        userName: userInfo?.displayName || 'User',
-        emoji
-      }
-    );
-
-    // Emit via socket
-    const io = req.app.get('io');
-    if (io) {
-      io.to(`conversation:${conversationId}`).emit('reaction_added', {
-        conversationId,
-        messageId,
-        userId,
-        userName: userInfo?.displayName,
-        emoji
-      });
-    }
+    await assertRoomAccess(req.params.roomId, req.userId, { limit: 1 });
+    const currentUser = await loadUser(req.userId);
+    const result = await papersignal.addReaction(req.params.roomId, req.params.messageId, {
+      userId: req.userId,
+      userName: getProfileName(currentUser),
+      emoji,
+    });
 
     res.json({ success: true, data: result });
   } catch (error) {
     console.error('Add reaction error:', error);
-    res.status(500).json({ success: false, message: 'Failed to add reaction' });
+    res.status(error.status || 500).json({ success: false, message: error.status === 403 ? 'Access denied' : 'Failed to add reaction' });
   }
 };
 
-// Remove reaction from message
 exports.removeReaction = async (req, res) => {
   try {
-    const { conversationId, messageId } = req.params;
     const { emoji } = req.body;
-    const userId = req.userId;
+    if (!emoji) return res.status(400).json({ success: false, message: 'Emoji is required' });
 
-    if (!emoji) {
-      return res.status(400).json({ success: false, message: 'Emoji is required' });
-    }
-
-    const conversation = await Conversation.findByPk(conversationId);
-    if (!conversation || !conversation.papersignalRoomId) {
-      return res.status(404).json({ success: false, message: 'Conversation not found' });
-    }
-
-    const result = await papersignal.removeReaction(
-      conversation.papersignalRoomId,
-      messageId,
-      userId,
-      emoji
-    );
-
-    // Emit via socket
-    const io = req.app.get('io');
-    if (io) {
-      io.to(`conversation:${conversationId}`).emit('reaction_removed', {
-        conversationId,
-        messageId,
-        userId,
-        emoji
-      });
-    }
-
+    await assertRoomAccess(req.params.roomId, req.userId, { limit: 1 });
+    const result = await papersignal.removeReaction(req.params.roomId, req.params.messageId, req.userId, emoji);
     res.json({ success: true, data: result });
   } catch (error) {
     console.error('Remove reaction error:', error);
-    res.status(500).json({ success: false, message: 'Failed to remove reaction' });
+    res.status(error.status || 500).json({ success: false, message: error.status === 403 ? 'Access denied' : 'Failed to remove reaction' });
   }
 };
 
-// Edit message
 exports.editMessage = async (req, res) => {
   try {
-    const { conversationId, messageId } = req.params;
     const { content } = req.body;
-    const userId = req.userId;
+    if (!content?.trim()) return res.status(400).json({ success: false, message: 'Content is required' });
 
-    if (!content || !content.trim()) {
-      return res.status(400).json({ success: false, message: 'Content is required' });
-    }
-
-    const conversation = await Conversation.findByPk(conversationId);
-    if (!conversation || !conversation.papersignalRoomId) {
-      return res.status(404).json({ success: false, message: 'Conversation not found' });
-    }
-
-    const result = await papersignal.editMessage(
-      conversation.papersignalRoomId,
-      messageId,
-      userId,
-      content.trim()
-    );
-
-    // Emit via socket
-    const io = req.app.get('io');
-    if (io) {
-      io.to(`conversation:${conversationId}`).emit('message_edited', {
-        conversationId,
-        messageId,
-        content: content.trim(),
-        editedAt: new Date()
-      });
-    }
-
+    await assertRoomAccess(req.params.roomId, req.userId, { limit: 1 });
+    const result = await papersignal.editMessage(req.params.roomId, req.params.messageId, req.userId, content.trim());
     res.json({ success: true, data: result });
   } catch (error) {
     console.error('Edit message error:', error);
-    res.status(500).json({ success: false, message: 'Failed to edit message' });
+    res.status(error.status || 500).json({ success: false, message: error.status === 403 ? 'Access denied' : 'Failed to edit message' });
   }
 };
 
-// Delete message
 exports.deleteMessage = async (req, res) => {
   try {
-    const { conversationId, messageId } = req.params;
-    const userId = req.userId;
-
-    const conversation = await Conversation.findByPk(conversationId);
-    if (!conversation || !conversation.papersignalRoomId) {
-      return res.status(404).json({ success: false, message: 'Conversation not found' });
-    }
-
-    const result = await papersignal.deleteMessage(
-      conversation.papersignalRoomId,
-      messageId,
-      userId
-    );
-
-    // Emit via socket
-    const io = req.app.get('io');
-    if (io) {
-      io.to(`conversation:${conversationId}`).emit('message_deleted', {
-        conversationId,
-        messageId,
-        deletedAt: new Date()
-      });
-    }
-
+    await assertRoomAccess(req.params.roomId, req.userId, { limit: 1 });
+    const result = await papersignal.deleteMessage(req.params.roomId, req.params.messageId, req.userId);
     res.json({ success: true, data: result });
   } catch (error) {
     console.error('Delete message error:', error);
-    res.status(500).json({ success: false, message: 'Failed to delete message' });
+    res.status(error.status || 500).json({ success: false, message: error.status === 403 ? 'Access denied' : 'Failed to delete message' });
   }
 };
 
-// Send typing indicator
-exports.sendTyping = async (req, res) => {
-  try {
-    const conversationId = req.params.id;
-    const userId = req.userId;
-
-    const userInfo = await getUserDisplayInfo(userId);
-
-    // Emit via socket
-    const io = req.app.get('io');
-    if (io) {
-      io.to(`conversation:${conversationId}`).emit('user_typing', {
-        conversationId,
-        userId,
-        userName: userInfo?.displayName || 'User'
-      });
-    }
-
-    res.json({ success: true });
-  } catch (error) {
-    console.error('Send typing error:', error);
-    res.status(500).json({ success: false, message: 'Failed to send typing indicator' });
-  }
-};
-
-// Get user presence
 exports.getPresence = async (req, res) => {
   try {
-    const { userId } = req.params;
-
-    const result = await papersignal.getPresence(userId);
-
+    const result = await papersignal.getPresence(req.params.userId);
     res.json({ success: true, data: result });
   } catch (error) {
     console.error('Get presence error:', error);
@@ -693,135 +379,17 @@ exports.getPresence = async (req, res) => {
   }
 };
 
-// Get bulk presence
 exports.getBulkPresence = async (req, res) => {
   try {
     const { userIds } = req.body;
-
-    if (!userIds || !Array.isArray(userIds)) {
+    if (!Array.isArray(userIds)) {
       return res.status(400).json({ success: false, message: 'userIds array is required' });
     }
 
     const result = await papersignal.getBulkPresence(userIds);
-
     res.json({ success: true, data: result });
   } catch (error) {
     console.error('Get bulk presence error:', error);
     res.status(500).json({ success: false, message: 'Failed to get presence' });
-  }
-};
-
-// Upload attachment (now handled via Papersignal's file handling or keep local)
-exports.uploadAttachment = async (req, res) => {
-  try {
-    // For now, we can use Cloudinary for file uploads and send the URL in message metadata
-    res.status(501).json({ success: false, message: 'Use Cloudinary upload and include URL in message' });
-  } catch (error) {
-    res.status(500).json({ success: false, message: 'Failed to upload' });
-  }
-};
-
-// Get contacts - active collaborations that can be messaged
-exports.getContacts = async (req, res) => {
-  try {
-    const userId = req.userId;
-    const userInfo = await getUserDisplayInfo(userId);
-
-    if (!userInfo) {
-      return res.status(400).json({ success: false, message: 'User profile not found' });
-    }
-
-    // Get active collaboration requests based on user type
-    let contacts = [];
-
-    if (userInfo.entityType === 'creator') {
-      // Creator sees brands they have active collaborations with
-      const requests = await CollaborationRequest.findAll({
-        where: {
-          creatorId: userInfo.entityId,
-          status: ['accepted', 'in_progress', 'content_submitted', 'revision_requested']
-        },
-        include: [
-          {
-            model: Brand,
-            as: 'brand',
-            attributes: ['id', 'companyName', 'logo', 'industry'],
-            include: [{ model: User, as: 'user', attributes: ['id'] }]
-          }
-        ],
-        order: [['updatedAt', 'DESC']]
-      });
-
-      // Group by brand (in case of multiple requests with same brand)
-      const brandMap = new Map();
-      for (const request of requests) {
-        if (!request.brand) continue;
-        const brandId = request.brand.id;
-        if (!brandMap.has(brandId)) {
-          brandMap.set(brandId, {
-            id: request.brand.id,
-            name: request.brand.companyName,
-            avatar: request.brand.logo,
-            userId: request.brand.user?.id,
-            industry: request.brand.industry,
-            type: 'brand',
-            activeRequests: []
-          });
-        }
-        brandMap.get(brandId).activeRequests.push({
-          id: request.id,
-          title: request.title,
-          status: request.status
-        });
-      }
-      contacts = Array.from(brandMap.values());
-    } else {
-      // Brand sees creators they have active collaborations with
-      const requests = await CollaborationRequest.findAll({
-        where: {
-          brandId: userInfo.entityId,
-          status: ['accepted', 'in_progress', 'content_submitted', 'revision_requested']
-        },
-        include: [
-          {
-            model: Creator,
-            as: 'creator',
-            attributes: ['id', 'displayName', 'profileImage', 'tier', 'primaryCategory'],
-            include: [{ model: User, as: 'user', attributes: ['id'] }]
-          }
-        ],
-        order: [['updatedAt', 'DESC']]
-      });
-
-      // Group by creator
-      const creatorMap = new Map();
-      for (const request of requests) {
-        if (!request.creator) continue;
-        const creatorId = request.creator.id;
-        if (!creatorMap.has(creatorId)) {
-          creatorMap.set(creatorId, {
-            id: request.creator.id,
-            name: request.creator.displayName,
-            avatar: request.creator.profileImage,
-            userId: request.creator.user?.id,
-            tier: request.creator.tier,
-            category: request.creator.primaryCategory,
-            type: 'creator',
-            activeRequests: []
-          });
-        }
-        creatorMap.get(creatorId).activeRequests.push({
-          id: request.id,
-          title: request.title,
-          status: request.status
-        });
-      }
-      contacts = Array.from(creatorMap.values());
-    }
-
-    res.json({ success: true, data: contacts });
-  } catch (error) {
-    console.error('Get contacts error:', error);
-    res.status(500).json({ success: false, message: 'Failed to get contacts' });
   }
 };

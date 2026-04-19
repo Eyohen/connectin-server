@@ -15,6 +15,7 @@ const opportunitiesRoutes = require('./routes/opportunities.routes');
 const notificationRoutes = require('./routes/notification.routes');
 const bookingsRoutes = require('./routes/bookings.routes');
 const adminRoutes = require('./routes/admin.routes');
+const messageRoutes = require('./routes/message.routes');
 
 const app = express();
 
@@ -82,6 +83,7 @@ app.use('/api/opportunities', opportunitiesRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/bookings', bookingsRoutes);
 app.use('/api/admin', adminRoutes);
+app.use('/api/messages', messageRoutes);
 
 app.use((req, res) => {
   res.status(404).json({
